@@ -34,6 +34,7 @@ impl Plugin for HttpClientPlugin {
         }
         app.add_event::<HttpRequest>();
         app.add_event::<HttpResponse>();
+        app.add_event::<HttpResponsePart>();
         app.add_event::<HttpResponseError>();
         app.add_systems(Update, (handle_request, handle_tasks));
     }
@@ -77,6 +78,19 @@ impl HttpClientSetting {
 pub struct HttpRequest {
     pub from_entity: Option<Entity>,
     pub request: Request,
+    /// if true, expect a chunked/streamed response and reply with multiple events.
+    pub streaming: bool,
+}
+
+impl HttpRequest {
+    pub fn with_streaming(mut self) -> Self {
+        self.streaming = true;
+        self
+    }
+    // pub fn with_entity(mut self, entity: Entity) -> Self {
+    //     self.from_entity = Some(entity);
+    //     self
+    // }
 }
 
 /// builder  for ehttp request
@@ -446,6 +460,7 @@ impl HttpClient {
     pub fn build(self) -> HttpRequest {
         HttpRequest {
             from_entity: self.from_entity,
+            streaming: false,
             request: Request {
                 method: self.method.expect("method is required"),
                 url: self.url.expect("url is required"),
@@ -475,6 +490,10 @@ impl HttpClient {
 /// wrap for ehttp response
 #[derive(Event, Debug, Clone, Deref)]
 pub struct HttpResponse(pub Response);
+
+/// wrap for ehttp response
+#[derive(Event, Deref)]
+pub struct HttpResponsePart(pub String);
 
 /// wrap for ehttp error
 #[derive(Event, Debug, Clone, Deref)]
@@ -506,39 +525,118 @@ fn handle_request(
             } else {
                 (commands.spawn_empty().id(), false)
             };
-            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (tx, rx) = crossbeam_channel::bounded(100);
 
-            thread_pool
-                .spawn(async move {
-                    let mut command_queue = CommandQueue::default();
+            if !req.streaming {
+                thread_pool
+                    .spawn(async move {
+                        let mut command_queue = CommandQueue::default();
 
-                    let response = ehttp::fetch_async(req.request).await;
-                    command_queue.push(move |world: &mut World| {
-                        match response {
-                            Ok(res) => {
-                                world
-                                    .get_resource_mut::<Events<HttpResponse>>()
-                                    .unwrap()
-                                    .send(HttpResponse(res));
+                        let response = ehttp::fetch_async(req.request).await;
+                        command_queue.push(move |world: &mut World| {
+                            match response {
+                                Ok(res) => {
+                                    world
+                                        .get_resource_mut::<Events<HttpResponse>>()
+                                        .unwrap()
+                                        .send(HttpResponse(res));
+                                }
+                                Err(e) => {
+                                    world
+                                        .get_resource_mut::<Events<HttpResponseError>>()
+                                        .unwrap()
+                                        .send(HttpResponseError::new(e.to_string()));
+                                }
                             }
-                            Err(e) => {
-                                world
-                                    .get_resource_mut::<Events<HttpResponseError>>()
-                                    .unwrap()
-                                    .send(HttpResponseError::new(e.to_string()));
+
+                            if has_from_entity {
+                                world.entity_mut(entity).remove::<RequestTask>();
+                            } else {
+                                world.entity_mut(entity).despawn_recursive();
                             }
-                        }
+                        });
 
-                        if has_from_entity {
-                            world.entity_mut(entity).remove::<RequestTask>();
-                        } else {
-                            world.entity_mut(entity).despawn_recursive();
-                        }
-                    });
+                        tx.send(command_queue).unwrap();
+                    })
+                    .detach();
+            } else {
+                // streaming version
+                let (stream_tx, stream_rx) = crossbeam_channel::bounded(100);
 
-                    tx.send(command_queue).unwrap();
-                })
-                .detach();
+                thread_pool
+                    .spawn(async move {
+                        println!("Calling ehttp::streaming::fetch");
+                        ehttp::streaming::fetch(
+                            req.request,
+                            Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
+                                let part = match result {
+                                    Ok(part) => part,
+                                    Err(err) => {
+                                        eprintln!("an error occurred while streaming {err}");
+                                        return std::ops::ControlFlow::Break(());
+                                    }
+                                };
+
+                                match part {
+                                    ehttp::streaming::Part::Response(response) => {
+                                        println!("Status code: {:?}", response.status);
+                                        if response.ok {
+                                            std::ops::ControlFlow::Continue(())
+                                        } else {
+                                            std::ops::ControlFlow::Break(())
+                                        }
+                                    }
+                                    ehttp::streaming::Part::Chunk(chunk) => {
+                                        if chunk.is_empty() {
+                                            return std::ops::ControlFlow::Break(());
+                                        }
+                                        let msg = String::from_utf8(chunk.clone()).unwrap();
+                                        println!("Got chunk: {msg:?}");
+                                        match stream_tx.send(msg) {
+                                            Ok(()) => std::ops::ControlFlow::Continue(()),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "failed to send chunk to stream_tx: {e:?}"
+                                                );
+                                                std::ops::ControlFlow::Break(())
+                                                // std::ops::ControlFlow::Continue(())
+                                            }
+                                        }
+                                    }
+                                }
+                            }),
+                        );
+                        println!("streaming fetch call has finished.");
+                    })
+                    .detach();
+                thread_pool
+                    .spawn(async move {
+                        println!("ehttp fetch called, now spawning the receiver");
+                        while let Ok(chunk) = stream_rx.recv() {
+                            println!("Received chunk: {chunk}");
+                            let mut command_queue = CommandQueue::default();
+                            command_queue.push(move |world: &mut World| {
+                                world
+                                    .get_resource_mut::<Events<HttpResponsePart>>()
+                                    .unwrap()
+                                    .send(HttpResponsePart(chunk));
+                            });
+                            tx.send(command_queue).unwrap();
+                        }
+                        println!("stream_rx dropped?, cleaning up");
+                        let mut command_queue = CommandQueue::default();
+                        command_queue.push(move |world: &mut World| {
+                            if has_from_entity {
+                                world.entity_mut(entity).remove::<RequestTask>();
+                            } else {
+                                world.entity_mut(entity).despawn_recursive();
+                            }
+                        });
+                        tx.send(command_queue).unwrap();
+                        println!("stream_sender finished");
+                    })
+                    .detach();
+            }
 
             commands.entity(entity).insert(RequestTask(rx));
             req_res.current_clients += 1;
@@ -554,7 +652,7 @@ fn handle_tasks(
     for task in request_tasks.iter_mut() {
         if let Ok(mut command_queue) = task.0.try_recv() {
             commands.append(&mut command_queue);
-            req_res.current_clients -= 1;
+            req_res.current_clients = req_res.current_clients.saturating_sub(1);
         }
     }
 }

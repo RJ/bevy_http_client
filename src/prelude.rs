@@ -1,5 +1,7 @@
 pub use super::{
-    typed::{HttpTypedRequestTrait, TypedRequest, TypedResponse, TypedResponseError},
+    typed::{
+        HttpTypedRequestTrait, TypedRequest, TypedResponse, TypedResponseError, TypedResponsePart,
+    },
     HttpClient, HttpClientPlugin, HttpClientSetting, HttpRequest, HttpResponse, HttpResponseError,
-    RequestTask,
+    HttpResponsePart, RequestTask,
 };

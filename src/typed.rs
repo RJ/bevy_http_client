@@ -41,6 +41,7 @@ impl HttpTypedRequestTrait for App {
     ) -> &mut Self {
         self.add_event::<TypedRequest<T>>();
         self.add_event::<TypedResponse<T>>();
+        self.add_event::<TypedResponsePart<T>>();
         self.add_event::<TypedResponseError<T>>();
         self.add_systems(PreUpdate, handle_typed_request::<T>);
         self
@@ -76,6 +77,8 @@ where
 {
     pub from_entity: Option<Entity>,
     pub request: Request,
+    /// if true, expect a chunked/streamed response and reply with multiple events.
+    pub streaming: bool,
     inner: PhantomData<T>,
 }
 
@@ -84,8 +87,16 @@ impl<T: for<'a> serde::Deserialize<'a>> TypedRequest<T> {
         TypedRequest {
             from_entity,
             request,
+            streaming: false,
             inner: PhantomData,
         }
+    }
+}
+
+impl<T: for<'a> Deserialize<'a>> TypedRequest<T> {
+    pub fn with_streaming(mut self) -> Self {
+        self.streaming = true;
+        self
     }
 }
 
@@ -125,6 +136,22 @@ impl<T: for<'a> serde::Deserialize<'a>> TypedResponse<T> {
     }
 }
 
+#[derive(Debug, Deref, Event)]
+pub struct TypedResponsePart<T>
+where
+    T: for<'a> Deserialize<'a>,
+{
+    #[deref]
+    inner: T,
+}
+
+impl<T: for<'a> serde::Deserialize<'a>> TypedResponsePart<T> {
+    /// Consumes the HTTP response and returns the inner data.
+    pub fn into_inner(self) -> T {
+        self.inner
+    }
+}
+
 #[derive(Event, Debug, Clone, Deref)]
 pub struct TypedResponseError<T> {
     #[deref]
@@ -152,10 +179,10 @@ impl<T> TypedResponseError<T> {
 fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
     mut commands: Commands,
     mut req_res: ResMut<HttpClientSetting>,
-    mut requests: EventReader<TypedRequest<T>>,
+    mut requests: ResMut<Events<TypedRequest<T>>>,
 ) {
     let thread_pool = IoTaskPool::get();
-    for request in requests.read() {
+    for request in requests.drain() {
         if req_res.is_available() {
             let (entity, has_from_entity) = if let Some(entity) = request.from_entity {
                 (entity, true)
@@ -165,55 +192,143 @@ fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
             let req = request.request.clone();
             let (tx, rx) = crossbeam_channel::bounded(1);
 
-            thread_pool
-                .spawn(async move {
-                    let mut command_queue = CommandQueue::default();
+            if !request.streaming {
+                thread_pool
+                    .spawn(async move {
+                        let mut command_queue = CommandQueue::default();
 
-                    let response = ehttp::fetch_async(req).await;
-                    command_queue.push(move |world: &mut World| {
-                        match response {
-                            Ok(response) => {
-                                let result: Result<T, _> =
-                                    serde_json::from_slice(response.bytes.as_slice());
+                        let response = ehttp::fetch_async(req).await;
+                        command_queue.push(move |world: &mut World| {
+                            match response {
+                                Ok(response) => {
+                                    let result: Result<T, _> =
+                                        serde_json::from_slice(response.bytes.as_slice());
 
-                                match result {
-                                    // deserialize success, send response
-                                    Ok(inner) => {
-                                        world
-                                            .get_resource_mut::<Events<TypedResponse<T>>>()
-                                            .unwrap()
-                                            .send(TypedResponse { inner });
-                                    }
-                                    // deserialize error, send error + response
-                                    Err(e) => {
-                                        world
-                                            .get_resource_mut::<Events<TypedResponseError<T>>>()
-                                            .unwrap()
-                                            .send(
-                                                TypedResponseError::new(e.to_string())
-                                                    .response(response),
-                                            );
+                                    match result {
+                                        // deserialize success, send response
+                                        Ok(inner) => {
+                                            world
+                                                .get_resource_mut::<Events<TypedResponse<T>>>()
+                                                .unwrap()
+                                                .send(TypedResponse { inner });
+                                        }
+                                        // deserialize error, send error + response
+                                        Err(e) => {
+                                            world
+                                                .get_resource_mut::<Events<TypedResponseError<T>>>()
+                                                .unwrap()
+                                                .send(
+                                                    TypedResponseError::new(e.to_string())
+                                                        .response(response),
+                                                );
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    world
+                                        .get_resource_mut::<Events<TypedResponseError<T>>>()
+                                        .unwrap()
+                                        .send(TypedResponseError::new(e.to_string()));
+                                }
                             }
-                            Err(e) => {
+
+                            if has_from_entity {
+                                world.entity_mut(entity).remove::<RequestTask>();
+                            } else {
+                                world.entity_mut(entity).despawn_recursive();
+                            }
+                        });
+
+                        tx.send(command_queue).unwrap()
+                    })
+                    .detach();
+            } else {
+                // streaming version
+                let (stream_tx, stream_rx) = crossbeam_channel::bounded::<T>(100);
+
+                thread_pool
+                    .spawn(async move {
+                        println!("Calling ehttp::streaming::fetch");
+                        ehttp::streaming::fetch(
+                            request.request.clone(),
+                            Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
+                                let part = match result {
+                                    Ok(part) => part,
+                                    Err(err) => {
+                                        eprintln!("an error occurred while streaming {err}");
+                                        return std::ops::ControlFlow::Break(());
+                                    }
+                                };
+
+                                match part {
+                                    ehttp::streaming::Part::Response(response) => {
+                                        println!("Status code: {:?}", response.status);
+                                        if response.ok {
+                                            std::ops::ControlFlow::Continue(())
+                                        } else {
+                                            std::ops::ControlFlow::Break(())
+                                        }
+                                    }
+                                    ehttp::streaming::Part::Chunk(chunk) => {
+                                        if chunk.is_empty() {
+                                            return std::ops::ControlFlow::Break(());
+                                        }
+                                        if let Ok(result) = serde_json::from_slice(chunk.as_slice())
+                                        {
+                                            println!(
+                                                "Got typed chunk: {}",
+                                                String::from_utf8(chunk.clone()).unwrap()
+                                            );
+                                            match stream_tx.send(result) {
+                                                Ok(()) => std::ops::ControlFlow::Continue(()),
+                                                Err(e) => {
+                                                    eprintln!(
+                                                        "failed to send chunk to stream_tx: {e:?}"
+                                                    );
+                                                    std::ops::ControlFlow::Break(())
+                                                    // std::ops::ControlFlow::Continue(())
+                                                }
+                                            }
+                                        } else {
+                                            eprintln!("failed to deserialize chunk");
+                                            // streamtx.send (error type?)
+                                            std::ops::ControlFlow::Break(())
+                                        }
+                                    }
+                                }
+                            }),
+                        );
+                        println!("streaming fetch call has finished.");
+                    })
+                    .detach();
+                thread_pool
+                    .spawn(async move {
+                        println!("ehttp fetch called, now spawning the receiver");
+                        while let Ok(chunk) = stream_rx.recv() {
+                            println!("Received typed chunk");
+                            let mut command_queue = CommandQueue::default();
+                            command_queue.push(move |world: &mut World| {
                                 world
-                                    .get_resource_mut::<Events<TypedResponseError<T>>>()
+                                    .get_resource_mut::<Events<TypedResponsePart<T>>>()
                                     .unwrap()
-                                    .send(TypedResponseError::new(e.to_string()));
+                                    .send(TypedResponsePart { inner: chunk });
+                            });
+                            tx.send(command_queue).unwrap();
+                        }
+                        println!("stream_rx dropped?, cleaning up");
+                        let mut command_queue = CommandQueue::default();
+                        command_queue.push(move |world: &mut World| {
+                            if has_from_entity {
+                                world.entity_mut(entity).remove::<RequestTask>();
+                            } else {
+                                world.entity_mut(entity).despawn_recursive();
                             }
-                        }
-
-                        if has_from_entity {
-                            world.entity_mut(entity).remove::<RequestTask>();
-                        } else {
-                            world.entity_mut(entity).despawn_recursive();
-                        }
-                    });
-
-                    tx.send(command_queue).unwrap()
-                })
-                .detach();
+                        });
+                        tx.send(command_queue).unwrap();
+                        println!("stream_sender finished");
+                    })
+                    .detach();
+            }
 
             commands.entity(entity).insert(RequestTask(rx));
             req_res.current_clients += 1;
