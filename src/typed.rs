@@ -175,6 +175,106 @@ impl<T> TypedResponseError<T> {
     }
 }
 
+async fn fetch_typed<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
+    req: Request,
+) -> CommandQueue {
+    let mut command_queue = CommandQueue::default();
+
+    let response = ehttp::fetch_async(req).await;
+    match response {
+        Ok(response) => {
+            let result: Result<T, _> = serde_json::from_slice(response.bytes.as_slice());
+            match result {
+                // deserialize success, send response
+                Ok(inner) => {
+                    command_queue.push(move |world: &mut World| {
+                        world
+                            .get_resource_mut::<Events<TypedResponse<T>>>()
+                            .unwrap()
+                            .send(TypedResponse { inner });
+                    });
+                }
+                Err(e) => {
+                    command_queue.push(move |world: &mut World| {
+                        world
+                            .get_resource_mut::<Events<TypedResponseError<T>>>()
+                            .unwrap()
+                            .send(TypedResponseError::new(e.to_string()).response(response));
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            command_queue.push(move |world: &mut World| {
+                world
+                    .get_resource_mut::<Events<TypedResponseError<T>>>()
+                    .unwrap()
+                    .send(TypedResponseError::new(e.to_string()));
+            });
+        }
+    }
+    command_queue
+}
+
+/// Fetch a chunked/streamed URL and send results to channel as they arrive
+async fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
+    req: Request,
+    stream_tx: crossbeam_channel::Sender<T>,
+) {
+    println!("Calling ehttp::streaming::fetch");
+    ehttp::streaming::fetch(
+        req.clone(),
+        Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
+            let part = match result {
+                Ok(part) => part,
+                Err(err) => {
+                    eprintln!("an error occurred while streaming {err}");
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
+
+            match part {
+                ehttp::streaming::Part::Response(response) => {
+                    println!("Status code: {:?}", response.status);
+                    println!("Partial response: {:?}", response);
+                    if response.ok {
+                        std::ops::ControlFlow::Continue(())
+                    } else {
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+                ehttp::streaming::Part::Chunk(chunk) => {
+                    if chunk.is_empty() {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    if let Ok(result) = serde_json::from_slice(chunk.as_slice()) {
+                        println!(
+                            "Got typed chunk: {}",
+                            String::from_utf8(chunk.clone()).unwrap()
+                        );
+                        match stream_tx.send(result) {
+                            Ok(()) => std::ops::ControlFlow::Continue(()),
+                            Err(e) => {
+                                eprintln!("failed to send chunk to stream_tx: {e:?}");
+                                std::ops::ControlFlow::Break(())
+                                // std::ops::ControlFlow::Continue(())
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "failed to deserialize chunk: {:?}",
+                            String::from_utf8(chunk.clone())
+                        );
+                        // streamtx.send (error type?)
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+            }
+        }),
+    );
+    println!("streaming fetch call has finished.");
+}
+
 /// A system that handles typed HTTP requests.
 fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
     mut commands: Commands,
@@ -183,155 +283,69 @@ fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
 ) {
     let thread_pool = IoTaskPool::get();
     for request in requests.drain() {
-        if req_res.is_available() {
-            let (entity, has_from_entity) = if let Some(entity) = request.from_entity {
-                (entity, true)
-            } else {
-                (commands.spawn_empty().id(), false)
-            };
-            let req = request.request.clone();
-            let (tx, rx) = crossbeam_channel::bounded(1);
+        if !req_res.is_available() {
+            continue;
+        }
 
-            if !request.streaming {
-                thread_pool
-                    .spawn(async move {
-                        let mut command_queue = CommandQueue::default();
+        let (entity, has_from_entity) = if let Some(entity) = request.from_entity {
+            (entity, true)
+        } else {
+            (commands.spawn_empty().id(), false)
+        };
+        let req = request.request.clone();
+        let (tx, rx) = crossbeam_channel::bounded(100);
 
-                        let response = ehttp::fetch_async(req).await;
-                        command_queue.push(move |world: &mut World| {
-                            match response {
-                                Ok(response) => {
-                                    let result: Result<T, _> =
-                                        serde_json::from_slice(response.bytes.as_slice());
-
-                                    match result {
-                                        // deserialize success, send response
-                                        Ok(inner) => {
-                                            world
-                                                .get_resource_mut::<Events<TypedResponse<T>>>()
-                                                .unwrap()
-                                                .send(TypedResponse { inner });
-                                        }
-                                        // deserialize error, send error + response
-                                        Err(e) => {
-                                            world
-                                                .get_resource_mut::<Events<TypedResponseError<T>>>()
-                                                .unwrap()
-                                                .send(
-                                                    TypedResponseError::new(e.to_string())
-                                                        .response(response),
-                                                );
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    world
-                                        .get_resource_mut::<Events<TypedResponseError<T>>>()
-                                        .unwrap()
-                                        .send(TypedResponseError::new(e.to_string()));
-                                }
-                            }
-
-                            if has_from_entity {
-                                world.entity_mut(entity).remove::<RequestTask>();
-                            } else {
-                                world.entity_mut(entity).despawn_recursive();
-                            }
-                        });
-
-                        tx.send(command_queue).unwrap()
-                    })
-                    .detach();
-            } else {
-                // streaming version
-                let (stream_tx, stream_rx) = crossbeam_channel::bounded::<T>(100);
-
-                thread_pool
-                    .spawn(async move {
-                        println!("Calling ehttp::streaming::fetch");
-                        ehttp::streaming::fetch(
-                            request.request.clone(),
-                            Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
-                                let part = match result {
-                                    Ok(part) => part,
-                                    Err(err) => {
-                                        eprintln!("an error occurred while streaming {err}");
-                                        return std::ops::ControlFlow::Break(());
-                                    }
-                                };
-
-                                match part {
-                                    ehttp::streaming::Part::Response(response) => {
-                                        println!("Status code: {:?}", response.status);
-                                        if response.ok {
-                                            std::ops::ControlFlow::Continue(())
-                                        } else {
-                                            std::ops::ControlFlow::Break(())
-                                        }
-                                    }
-                                    ehttp::streaming::Part::Chunk(chunk) => {
-                                        if chunk.is_empty() {
-                                            return std::ops::ControlFlow::Break(());
-                                        }
-                                        if let Ok(result) = serde_json::from_slice(chunk.as_slice())
-                                        {
-                                            println!(
-                                                "Got typed chunk: {}",
-                                                String::from_utf8(chunk.clone()).unwrap()
-                                            );
-                                            match stream_tx.send(result) {
-                                                Ok(()) => std::ops::ControlFlow::Continue(()),
-                                                Err(e) => {
-                                                    eprintln!(
-                                                        "failed to send chunk to stream_tx: {e:?}"
-                                                    );
-                                                    std::ops::ControlFlow::Break(())
-                                                    // std::ops::ControlFlow::Continue(())
-                                                }
-                                            }
-                                        } else {
-                                            eprintln!("failed to deserialize chunk");
-                                            // streamtx.send (error type?)
-                                            std::ops::ControlFlow::Break(())
-                                        }
-                                    }
-                                }
-                            }),
-                        );
-                        println!("streaming fetch call has finished.");
-                    })
-                    .detach();
-                thread_pool
-                    .spawn(async move {
-                        println!("ehttp fetch called, now spawning the receiver");
-                        while let Ok(chunk) = stream_rx.recv() {
-                            println!("Received typed chunk");
-                            let mut command_queue = CommandQueue::default();
-                            command_queue.push(move |world: &mut World| {
-                                world
-                                    .get_resource_mut::<Events<TypedResponsePart<T>>>()
-                                    .unwrap()
-                                    .send(TypedResponsePart { inner: chunk });
-                            });
-                            tx.send(command_queue).unwrap();
-                        }
-                        println!("stream_rx dropped?, cleaning up");
+        if request.streaming {
+            let (stream_tx, stream_rx) = crossbeam_channel::bounded::<T>(100);
+            thread_pool
+                .spawn(async move {
+                    fetch_typed_streaming(req, stream_tx).await;
+                })
+                .detach();
+            thread_pool
+                .spawn(async move {
+                    println!("ehttp fetch called, now spawning the receiver");
+                    while let Ok(chunk) = stream_rx.recv() {
+                        println!("Received typed chunk");
                         let mut command_queue = CommandQueue::default();
                         command_queue.push(move |world: &mut World| {
-                            if has_from_entity {
-                                world.entity_mut(entity).remove::<RequestTask>();
-                            } else {
-                                world.entity_mut(entity).despawn_recursive();
-                            }
+                            world
+                                .get_resource_mut::<Events<TypedResponsePart<T>>>()
+                                .unwrap()
+                                .send(TypedResponsePart { inner: chunk });
                         });
                         tx.send(command_queue).unwrap();
-                        println!("stream_sender finished");
-                    })
-                    .detach();
-            }
-
-            commands.entity(entity).insert(RequestTask(rx));
-            req_res.current_clients += 1;
+                    }
+                    println!("stream_rx dropped?, cleaning up");
+                    let mut command_queue = CommandQueue::default();
+                    command_queue.push(move |world: &mut World| {
+                        if has_from_entity {
+                            world.entity_mut(entity).remove::<RequestTask>();
+                        } else {
+                            world.entity_mut(entity).despawn_recursive();
+                        }
+                    });
+                    tx.send(command_queue).unwrap();
+                    println!("stream_sender finished");
+                })
+                .detach();
+        } else {
+            // No streaming:
+            thread_pool
+                .spawn(async move {
+                    let mut command_queue = fetch_typed::<T>(req).await;
+                    command_queue.push(move |world: &mut World| {
+                        if has_from_entity {
+                            world.entity_mut(entity).remove::<RequestTask>();
+                        } else {
+                            world.entity_mut(entity).despawn_recursive();
+                        }
+                    });
+                    tx.send(command_queue).unwrap();
+                })
+                .detach();
         }
+        commands.entity(entity).insert(RequestTask(rx));
+        req_res.current_clients += 1;
     }
 }

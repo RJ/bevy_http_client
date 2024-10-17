@@ -110,8 +110,7 @@ pub struct HttpClient {
     /// ("Accept", "*/*"), …
     headers: Option<Headers>,
 
-    /// Request mode used on fetch. Only available on wasm builds
-    #[cfg(target_arch = "wasm32")]
+    /// Request mode used on fetch.
     pub mode: ehttp::Mode,
 }
 
@@ -123,7 +122,6 @@ impl Default for HttpClient {
             url: None,
             body: vec![],
             headers: Some(Headers::new(&[("Accept", "*/*")])),
-            #[cfg(target_arch = "wasm32")]
             mode: ehttp::Mode::default(),
         }
     }
@@ -466,7 +464,6 @@ impl HttpClient {
                 url: self.url.expect("url is required"),
                 body: self.body,
                 headers: self.headers.expect("headers is required"),
-                #[cfg(target_arch = "wasm32")]
                 mode: self.mode,
             },
         }
@@ -479,7 +476,6 @@ impl HttpClient {
                 url: self.url.expect("url is required"),
                 body: self.body,
                 headers: self.headers.expect("headers is required"),
-                #[cfg(target_arch = "wasm32")]
                 mode: self.mode,
             },
             self.from_entity,
@@ -510,6 +506,49 @@ impl HttpResponseError {
 /// task for ehttp response result
 #[derive(Component, Debug)]
 pub struct RequestTask(pub Receiver<CommandQueue>);
+
+async fn fetch_streaming(req: Request, stream_tx: crossbeam_channel::Sender<String>) {
+    println!("Calling ehttp::streaming::fetch");
+    ehttp::streaming::fetch(
+        req,
+        Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
+            let part = match result {
+                Ok(part) => part,
+                Err(err) => {
+                    eprintln!("an error occurred while streaming {err}");
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
+
+            match part {
+                ehttp::streaming::Part::Response(response) => {
+                    println!("Status code: {:?}", response.status);
+                    if response.ok {
+                        std::ops::ControlFlow::Continue(())
+                    } else {
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+                ehttp::streaming::Part::Chunk(chunk) => {
+                    if chunk.is_empty() {
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    let msg = String::from_utf8(chunk.clone()).unwrap();
+                    println!("Got chunk: {msg:?}");
+                    match stream_tx.send(msg) {
+                        Ok(()) => std::ops::ControlFlow::Continue(()),
+                        Err(e) => {
+                            eprintln!("failed to send chunk to stream_tx: {e:?}");
+                            std::ops::ControlFlow::Break(())
+                            // std::ops::ControlFlow::Continue(())
+                        }
+                    }
+                }
+            }
+        }),
+    );
+    println!("streaming fetch call has finished.");
+}
 
 fn handle_request(
     mut commands: Commands,
@@ -565,48 +604,7 @@ fn handle_request(
 
                 thread_pool
                     .spawn(async move {
-                        println!("Calling ehttp::streaming::fetch");
-                        ehttp::streaming::fetch(
-                            req.request,
-                            Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
-                                let part = match result {
-                                    Ok(part) => part,
-                                    Err(err) => {
-                                        eprintln!("an error occurred while streaming {err}");
-                                        return std::ops::ControlFlow::Break(());
-                                    }
-                                };
-
-                                match part {
-                                    ehttp::streaming::Part::Response(response) => {
-                                        println!("Status code: {:?}", response.status);
-                                        if response.ok {
-                                            std::ops::ControlFlow::Continue(())
-                                        } else {
-                                            std::ops::ControlFlow::Break(())
-                                        }
-                                    }
-                                    ehttp::streaming::Part::Chunk(chunk) => {
-                                        if chunk.is_empty() {
-                                            return std::ops::ControlFlow::Break(());
-                                        }
-                                        let msg = String::from_utf8(chunk.clone()).unwrap();
-                                        println!("Got chunk: {msg:?}");
-                                        match stream_tx.send(msg) {
-                                            Ok(()) => std::ops::ControlFlow::Continue(()),
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "failed to send chunk to stream_tx: {e:?}"
-                                                );
-                                                std::ops::ControlFlow::Break(())
-                                                // std::ops::ControlFlow::Continue(())
-                                            }
-                                        }
-                                    }
-                                }
-                            }),
-                        );
-                        println!("streaming fetch call has finished.");
+                        fetch_streaming(req.request, stream_tx).await;
                     })
                     .detach();
                 thread_pool
