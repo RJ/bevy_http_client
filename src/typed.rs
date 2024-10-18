@@ -217,9 +217,11 @@ async fn fetch_typed<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
 }
 
 /// Fetch a chunked/streamed URL and send results to channel as they arrive
-async fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
+fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
     req: Request,
-    stream_tx: crossbeam_channel::Sender<T>,
+    tx: crossbeam_channel::Sender<CommandQueue>,
+    entity: Entity,
+    has_from_entity: bool,
 ) {
     println!("Calling ehttp::streaming::fetch");
     ehttp::streaming::fetch(
@@ -245,6 +247,17 @@ async fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'stati
                 }
                 ehttp::streaming::Part::Chunk(chunk) => {
                     if chunk.is_empty() {
+                        println!("Received empty chunk, breaking");
+                        println!("Sending cleanup cmd to q");
+                        let mut command_queue = CommandQueue::default();
+                        command_queue.push(move |world: &mut World| {
+                            if has_from_entity {
+                                world.entity_mut(entity).remove::<RequestTask>();
+                            } else {
+                                world.entity_mut(entity).despawn_recursive();
+                            }
+                        });
+                        tx.send(command_queue).unwrap();
                         return std::ops::ControlFlow::Break(());
                     }
                     if let Ok(result) = serde_json::from_slice(chunk.as_slice()) {
@@ -252,14 +265,26 @@ async fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'stati
                             "Got typed chunk: {}",
                             String::from_utf8(chunk.clone()).unwrap()
                         );
-                        match stream_tx.send(result) {
-                            Ok(()) => std::ops::ControlFlow::Continue(()),
-                            Err(e) => {
-                                eprintln!("failed to send chunk to stream_tx: {e:?}");
-                                std::ops::ControlFlow::Break(())
-                                // std::ops::ControlFlow::Continue(())
-                            }
-                        }
+                        // HANDLE CHUNK
+                        println!("Received typed chunk, sending CmdQ to tx");
+                        let mut command_queue = CommandQueue::default();
+                        command_queue.push(move |world: &mut World| {
+                            world
+                                .get_resource_mut::<Events<TypedResponsePart<T>>>()
+                                .unwrap()
+                                .send(TypedResponsePart { inner: result });
+                        });
+                        tx.send(command_queue).unwrap();
+                        std::ops::ControlFlow::Continue(())
+
+                        // match stream_tx.send(result) {
+                        //     Ok(()) => std::ops::ControlFlow::Continue(()),
+                        //     Err(e) => {
+                        //         eprintln!("failed to send chunk to stream_tx: {e:?}");
+                        //         std::ops::ControlFlow::Break(())
+                        //         // std::ops::ControlFlow::Continue(())
+                        //     }
+                        // }
                     } else {
                         eprintln!(
                             "failed to deserialize chunk: {:?}",
@@ -294,39 +319,16 @@ fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
         };
         let req = request.request.clone();
         let (tx, rx) = crossbeam_channel::bounded(100);
+        commands.entity(entity).insert(RequestTask(rx));
+        req_res.current_clients += 1;
 
         if request.streaming {
-            let (stream_tx, stream_rx) = crossbeam_channel::bounded::<T>(100);
+            // let (stream_tx, stream_rx) = crossbeam_channel::bounded::<T>(100);
             thread_pool
                 .spawn(async move {
-                    fetch_typed_streaming(req, stream_tx).await;
-                })
-                .detach();
-            thread_pool
-                .spawn(async move {
-                    println!("ehttp fetch called, now spawning the receiver");
-                    while let Ok(chunk) = stream_rx.recv() {
-                        println!("Received typed chunk");
-                        let mut command_queue = CommandQueue::default();
-                        command_queue.push(move |world: &mut World| {
-                            world
-                                .get_resource_mut::<Events<TypedResponsePart<T>>>()
-                                .unwrap()
-                                .send(TypedResponsePart { inner: chunk });
-                        });
-                        tx.send(command_queue).unwrap();
-                    }
-                    println!("stream_rx dropped?, cleaning up");
-                    let mut command_queue = CommandQueue::default();
-                    command_queue.push(move |world: &mut World| {
-                        if has_from_entity {
-                            world.entity_mut(entity).remove::<RequestTask>();
-                        } else {
-                            world.entity_mut(entity).despawn_recursive();
-                        }
-                    });
-                    tx.send(command_queue).unwrap();
-                    println!("stream_sender finished");
+                    fetch_typed_streaming::<T>(req, tx, entity, has_from_entity);
+
+                    println!("spawned task finishing");
                 })
                 .detach();
         } else {
@@ -345,7 +347,5 @@ fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
                 })
                 .detach();
         }
-        commands.entity(entity).insert(RequestTask(rx));
-        req_res.current_clients += 1;
     }
 }
