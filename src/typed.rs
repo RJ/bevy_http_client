@@ -223,7 +223,7 @@ fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
     entity: Entity,
     has_from_entity: bool,
 ) {
-    println!("Calling ehttp::streaming::fetch");
+    // println!("Calling ehttp::streaming::fetch");
     ehttp::streaming::fetch(
         req.clone(),
         Box::new(move |result: ehttp::Result<ehttp::streaming::Part>| {
@@ -237,8 +237,8 @@ fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
 
             match part {
                 ehttp::streaming::Part::Response(response) => {
-                    println!("Status code: {:?}", response.status);
-                    println!("Partial response: {:?}", response);
+                    // println!("Status code: {:?}", response.status);
+                    // println!("Partial response: {:?}", response);
                     if response.ok {
                         std::ops::ControlFlow::Continue(())
                     } else {
@@ -247,8 +247,8 @@ fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
                 }
                 ehttp::streaming::Part::Chunk(chunk) => {
                     if chunk.is_empty() {
-                        println!("Received empty chunk, breaking");
-                        println!("Sending cleanup cmd to q");
+                        // println!("Received empty chunk, breaking");
+                        // println!("Sending cleanup cmd to q");
                         let mut command_queue = CommandQueue::default();
                         command_queue.push(move |world: &mut World| {
                             if has_from_entity {
@@ -261,12 +261,12 @@ fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
                         return std::ops::ControlFlow::Break(());
                     }
                     if let Ok(result) = serde_json::from_slice(chunk.as_slice()) {
-                        println!(
-                            "Got typed chunk: {}",
-                            String::from_utf8(chunk.clone()).unwrap()
-                        );
+                        // println!(
+                        //     "Got typed chunk: {}",
+                        //     String::from_utf8(chunk.clone()).unwrap()
+                        // );
                         // HANDLE CHUNK
-                        println!("Received typed chunk, sending CmdQ to tx");
+                        // println!("Received typed chunk, sending CmdQ to tx");
                         let mut command_queue = CommandQueue::default();
                         command_queue.push(move |world: &mut World| {
                             world
@@ -297,7 +297,7 @@ fn fetch_typed_streaming<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
             }
         }),
     );
-    println!("streaming fetch call has finished.");
+    // println!("streaming fetch call has finished.");
 }
 
 /// A system that handles typed HTTP requests.
@@ -328,7 +328,7 @@ fn handle_typed_request<T: for<'a> Deserialize<'a> + Send + Sync + 'static>(
                 .spawn(async move {
                     fetch_typed_streaming::<T>(req, tx, entity, has_from_entity);
 
-                    println!("spawned task finishing");
+                    // println!("spawned task finishing");
                 })
                 .detach();
         } else {

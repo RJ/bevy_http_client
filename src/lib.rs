@@ -649,6 +649,7 @@ fn handle_tasks(
 ) {
     for task in request_tasks.iter_mut() {
         if let Ok(mut command_queue) = task.0.try_recv() {
+            println!("Received command queue from task, executing");
             commands.append(&mut command_queue);
             req_res.current_clients = req_res.current_clients.saturating_sub(1);
         }
